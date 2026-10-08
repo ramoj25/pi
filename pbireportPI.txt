@@ -1,0 +1,606 @@
+let
+    Output =
+        let
+    StorageAccountUrl =
+        "https://stwvdinonprod.blob.core.windows.net",
+ 
+    ContainerName = "allrecommendations",
+    FilePrefix = "recommendations",
+    FileSuffix = ".json",
+ 
+    // ============================================================
+    // FINAL OUTPUT SCHEMA
+    // ============================================================
+    FinalType = type table [
+        SnapshotDate = nullable date,
+        SubscriptionId = nullable text,
+        ResourceGroup = nullable text,
+        DeviceName = nullable text,
+        Category = nullable text,
+        Impact = nullable text,
+        Field = nullable text,
+        RecommendationTypeId = nullable text,
+        RecommendationName = nullable text,
+        Problem = nullable text,
+        Solution = nullable text,
+        RecommendationSubCategory = nullable text,
+        MaturityLevel = nullable text,
+        ResourceId = nullable text,
+        LastUpdated = nullable datetimezone,
+        RecommendationKey = nullable text,
+        KPIGroup = nullable text
+    ],
+ 
+    // ============================================================
+    // NULL-SAFE HELPER FUNCTIONS
+    // ============================================================
+    fxNormalizeName = (name as text) as text =>
+        Text.Lower(Text.Remove(name, {" ", "_", "-"})),
+
+    fxField = (inputRecord as any, fieldName as text) as any =>
+        if Value.Is(inputRecord, type record) then
+            let
+                // Ignores case, spaces, _ and - so "Business Impact" matches "BusinessImpact"
+                MatchedName =
+                    List.First(
+                        List.Select(
+                            Record.FieldNames(inputRecord),
+                            each fxNormalizeName(_) = fxNormalizeName(fieldName)
+                        ),
+                        null
+                    )
+            in
+                if MatchedName = null then
+                    null
+                else
+                    Record.Field(inputRecord, MatchedName)
+        else
+            null,
+ 
+    fxText = (inputValue as any) as nullable text =>
+        let
+            Converted =
+                if inputValue = null then
+                    null
+                else
+                    try Text.Trim(Text.From(inputValue, "en-US"))
+					                    otherwise null
+        in
+            if Converted = "" then null else Converted,
+
+    // First non-empty text value among the candidate field names
+    fxFirstText = (inputRecord as any, fieldNames as list) as nullable text =>
+        List.First(
+            List.RemoveNulls(
+                List.Transform(
+                    fieldNames,
+                    each fxText(fxField(inputRecord, _))
+                )
+            ),
+            null
+        ),
+ 
+    fxResourceSegment = (
+        resourceId as nullable text,
+        segmentName as text
+    ) as nullable text =>
+        let
+            Segments =
+                if resourceId = null then
+                    {}
+                else
+                    List.Select(
+                        Text.Split(resourceId, "/"),
+                        each _ <> ""
+                    ),
+ 
+            LowerSegments =
+                List.Transform(Segments, each Text.Lower(_)),
+ 
+            Position =
+                List.PositionOf(
+                    LowerSegments,
+                    Text.Lower(segmentName)
+                ),
+ 
+            Result =
+                if Position >= 0
+                    and Position + 1 < List.Count(Segments)
+                then
+                    try Segments{Position + 1} otherwise null
+                else
+                    null
+        in
+            fxText(Result),
+ 
+    fxSnapshotDateFromFileName = (fileName as nullable text)
+        as nullable date =>
+        let
+            LeafName =
+                if fileName = null then
+                    null
+                else
+                    try Text.AfterDelimiter(
+                        fileName,
+                        "/",
+                        {0, RelativePosition.FromEnd}
+                    )
+                    otherwise fileName,
+					
+            LowerName =
+                if LeafName = null then null else Text.Lower(LeafName),
+
+            NameWithoutSuffix =
+                if LowerName <> null
+                    and Text.EndsWith(
+                        LowerName,
+                        Text.Lower(FileSuffix)
+                    )
+                then
+                    Text.Start(
+                        LeafName,
+                        Text.Length(LeafName) - Text.Length(FileSuffix)
+                    )
+                else
+                    LeafName,
+
+            LowerBaseName =
+                if NameWithoutSuffix = null then
+                    null
+                else
+                    Text.Lower(NameWithoutSuffix),
+ 
+            // Accepts recommendationsYYYYMMDD.json and recommendationsYYYYMMDD_<sub>_<page>.json
+            IsExpectedPattern =
+                LowerBaseName <> null
+                    and Text.Length(LowerBaseName)
+                        >= Text.Length(FilePrefix) + 8
+                    and Text.StartsWith(
+                        LowerBaseName,
+                        Text.Lower(FilePrefix)
+                    ),
+            DateToken =
+                if IsExpectedPattern then
+                    try Text.Middle(
+                        NameWithoutSuffix,
+                        Text.Length(FilePrefix),
+                        8
+                    )
+                    otherwise null
+                else
+                    null,
+ 
+            ParsedDate =
+                if DateToken = null
+                    or Text.Length(DateToken) <> 8
+                then
+                    null
+                else
+                    try #date(
+                        Number.FromText(Text.Start(DateToken, 4)),
+                        Number.FromText(Text.Middle(DateToken, 4, 2)),
+                        Number.FromText(Text.End(DateToken, 2))
+                    )
+                    otherwise null
+        in
+            ParsedDate,
+			
+			
+    // ============================================================
+    // TRANSFORM ONE JSON BLOB INTO FACT ROWS
+    // ============================================================
+    fxTransformBlob = (
+        blobContent as binary,
+        snapshotDate as nullable date
+    ) as table =>
+        let
+            ParsedJson =
+                try Json.Document(blobContent)
+                otherwise null,
+ 
+            // Expected structure is a top-level JSON array.
+            // A single-record fallback is included defensively.
+            // Raw API page is { value: [...], nextLink }; older files are a top-level array
+            JsonItems =
+                if Value.Is(ParsedJson, type list) then
+                    ParsedJson
+                else if Value.Is(ParsedJson, type record)
+                    and Value.Is(fxField(ParsedJson, "value"), type list)
+                then
+                    fxField(ParsedJson, "value")
+                else if Value.Is(ParsedJson, type record) then
+                    {ParsedJson}
+                else
+                    {},
+ 
+            RecommendationRecords =
+                List.Combine(
+                    List.Transform(
+                        JsonItems,
+                        (Item) =>
+                            if Value.Is(Item, type record) then
+                                {Item}
+                            else if Value.Is(Item, type text) then
+                                let
+                                    NestedJson =
+                                        try Json.Document(Item)
+                                        otherwise null,
+
+                                    NestedItems =
+                                        if Value.Is(NestedJson, type list) then
+                                            NestedJson
+                                        else if Value.Is(NestedJson, type record) then
+                                            {NestedJson}
+                                        else
+                                            {}
+                                in
+                                    List.Select(
+                                        NestedItems,
+                                        each Value.Is(_, type record)
+                                    )
+                            else
+                                {}
+                    )
+                ),
+ 
+            OutputRecords =
+                List.Transform(
+                    RecommendationRecords,
+                    (Recommendation as record) as record =>
+                        let
+                            Properties =
+                                fxField(
+                                    Recommendation,
+                                    "properties"
+                                ) ?? Recommendation,
+ 
+                            ShortDescription =
+                                fxField(
+                                    Properties,
+                                    "shortDescription"
+                                ) ?? Properties,
+ 
+                            ExtendedProperties =
+                                fxField(
+                                    Properties,
+                                    "extendedProperties"
+                                ) ?? Properties,
+ 
+                            ResourceMetadata =
+                                fxField(
+                                    Properties,
+                                    "resourceMetadata"
+                                ) ?? Properties,
+								
+                            ResourceId =
+                                fxText(
+                                    fxField(
+                                        ResourceMetadata,
+                                        "resourceId"
+                                    )
+                                ),
+ 
+                            SubscriptionId =
+                                fxResourceSegment(
+                                    ResourceId,
+                                    "subscriptions"
+                                ) ?? fxText(
+                                    fxField(Recommendation, "SubscriptionId")
+                                ),
+ 
+                            ResourceGroup =
+                                fxResourceSegment(
+                                    ResourceId,
+                                    "resourcegroups"
+                                ),
+ 
+                            ResourceSegments =
+                                if ResourceId = null then
+                                    {}
+                                else
+                                    List.Select(
+                                        Text.Split(ResourceId, "/"),
+                                        each _ <> ""
+                                    ),
+ 
+                            ResourceLeaf =
+                                try List.Last(ResourceSegments)
+                                otherwise null,
+ 
+                            ImpactedValue =
+                                fxFirstText(
+                                    Properties,
+                                    {"impactedValue", "DeviceName"}
+                                ),
+								
+                            DeviceName =
+                                if ImpactedValue <> null then
+                                    ImpactedValue
+                                else
+                                    fxText(ResourceLeaf),
+ 
+                            Category =
+                                fxText(
+                                    fxField(Properties, "category")
+                                ),
+ 
+                            Impact =
+                                fxFirstText(
+                                    Properties,
+                                    {"impact", "BusinessImpact"}
+                                ),
+
+                            Field =
+                                fxFirstText(
+                                    Properties,
+                                    {"impactedField", "Field"}
+                                ),
+ 
+                            RecommendationTypeId =
+                                fxText(
+                                    fxField(
+                                        Properties,
+                                        "recommendationTypeId"
+                                    )
+                                ),
+ 
+                            RecommendationName =
+                                fxText(
+                                    fxField(Recommendation, "name")
+                                        ?? fxField(Recommendation, "RecommendationName")
+                                ),
+ 
+                            Problem =
+                                fxFirstText(
+                                    ShortDescription,
+                                    {"problem", "Description"}
+                                ),
+ 
+                            Solution =
+                                fxText(
+                                    fxField(
+                                        ShortDescription,
+                                        "solution"
+                                    )
+                                ),
+ 
+                            RecommendationSubCategory =
+                                fxText(
+                                    fxField(
+                                        ExtendedProperties,
+                                        "recommendationSubCategory"
+                                    )
+                                ),
+								
+                            MaturityLevel =
+                                fxText(
+                                    fxField(
+                                        ExtendedProperties,
+                                        "maturityLevel"
+                                    )
+                                ),
+ 
+                            LastUpdatedRaw =
+                                fxField(
+                                    Properties,
+                                    "lastUpdated"
+                                ),
+ 
+                            LastUpdated =
+                                if LastUpdatedRaw = null then
+                                    null
+                                else
+                                    try DateTimeZone.From(
+                                        LastUpdatedRaw
+                                    )
+                                    otherwise null,
+ 
+                            RecommendationKey =
+                                Text.Combine(
+                                    {
+                                        if SubscriptionId = null
+                                            then ""
+                                            else SubscriptionId,
+                                        if RecommendationTypeId = null
+                                            then ""
+                                            else RecommendationTypeId,
+                                        if DeviceName = null
+                                            then ""
+                                            else DeviceName
+                                    },
+                                    "|"
+                                ),
+ 
+                            RowSnapshotDate =
+                                try Date.From(
+                                    fxText(fxField(Recommendation, "SnapshotDate"))
+                                )
+                                otherwise null,
+
+                            KPIGroup =
+                                if Category = "Cost" then
+                                    "Sustainability & Cost"
+                                else if Category = "Security" then
+                                    "Security"
+                                else if List.Contains(
+                                    {
+                                        "Performance",
+                                        "HighAvailability"
+                                    },
+                                    Category
+                                ) then
+                                    "Service Reliable & Predictable"
+                                else if Category =
+                                    "OperationalExcellence"
+                                then
+                                    "Operational Excellence"
+                                else
+                                    "Other"
+                        in
+                            [
+                                SnapshotDate = RowSnapshotDate ?? snapshotDate,
+                                SubscriptionId = SubscriptionId,
+                                ResourceGroup = ResourceGroup,
+                                DeviceName = DeviceName,
+                                Category = Category,
+                                Impact = Impact,
+                                Field = Field,
+                                RecommendationTypeId =
+                                    RecommendationTypeId,
+                                RecommendationName =
+                                    RecommendationName,
+                                Problem = Problem,
+                                Solution = Solution,
+                                RecommendationSubCategory =
+                                    RecommendationSubCategory,
+                                MaturityLevel = MaturityLevel,
+                                ResourceId = ResourceId,
+                                LastUpdated = LastUpdated,
+                                RecommendationKey =
+                                    RecommendationKey,
+                                KPIGroup = KPIGroup
+                            ]
+                ),
+				
+            Result =
+                if List.Count(OutputRecords) = 0 then
+                    #table(FinalType, {})
+                else
+                    Table.FromRecords(
+                        OutputRecords,
+                        FinalType,
+                        MissingField.UseNull
+                    )
+        in
+            Result,
+			 // ============================================================
+    // CONNECT TO AZURE BLOB STORAGE
+    // ============================================================
+    StorageNavigation =
+        AzureStorage.Blobs(StorageAccountUrl),
+ 
+    ContainerBlobs =
+        try StorageNavigation{[Name = ContainerName]}[Data]
+        otherwise
+            error Error.Record(
+                "ContainerNotFound",
+                "The Azure Blob container could not be opened.",
+                ContainerName
+            ),
+ 
+    RequiredBlobColumns =
+        Table.SelectColumns(
+            ContainerBlobs,
+            {"Content", "Name"},
+            MissingField.UseNull
+        ),
+		
+    WithLeafName =
+        Table.AddColumn(
+            RequiredBlobColumns,
+            "FileLeafName",
+            each
+                let
+                    RawName = try Text.From([Name]) otherwise null,
+                    NormalizedName =
+                        if RawName = null then
+                            null
+                        else
+                            Text.Replace(
+                                RawName,
+                                Character.FromNumber(92),
+                                "/"
+                            ),
+                    LeafName =
+                        if NormalizedName = null then
+                            null
+                        else
+                            try Text.AfterDelimiter(
+                                NormalizedName,
+                                "/",
+                                {0, RelativePosition.FromEnd}
+                            )
+                            otherwise NormalizedName
+                in
+                    if LeafName = null then null else Text.Trim(LeafName),
+            type nullable text
+        ),
+ 
+    // Filter before Json.Document so unrelated blobs are not parsed.
+    CandidateFiles =
+        Table.SelectRows(
+            WithLeafName,
+            each
+                [Content] <> null
+                    and [FileLeafName] <> null
+                    and Text.StartsWith(
+                        Text.Lower([FileLeafName]),
+                        Text.Lower(FilePrefix)
+                    )
+        ),
+		
+    WithSnapshotDate =
+        Table.AddColumn(
+            CandidateFiles,
+            "SnapshotDate",
+            each fxSnapshotDateFromFileName([FileLeafName]),
+            type nullable date
+        ),
+ 
+    // Removes malformed names and impossible dates such as 20261345.
+    ValidSnapshotFiles =
+        Table.SelectRows(
+            WithSnapshotDate,
+            each [SnapshotDate] <> null
+        ),
+		
+    WithParsedData =
+        Table.AddColumn(
+            ValidSnapshotFiles,
+            "AdvisorRows",
+            each
+                try fxTransformBlob(
+                    [Content],
+                    [SnapshotDate]
+                )
+                otherwise #table(FinalType, {}),
+            FinalType
+        ),
+		
+    OnlyParsedData =
+        Table.SelectColumns(
+            WithParsedData,
+            {"AdvisorRows"}
+        ),
+ 
+    ExpandedRows =
+        Table.ExpandTableColumn(
+            OnlyParsedData,
+            "AdvisorRows",
+            {
+                "SnapshotDate",
+                "SubscriptionId",
+                "ResourceGroup",
+                "DeviceName",
+                "Category",
+                "Impact",
+                "Field",
+                "RecommendationTypeId",
+                "RecommendationName",
+                "Problem",
+                "Solution",
+                "RecommendationSubCategory",
+                "MaturityLevel",
+                "ResourceId",
+                "LastUpdated",
+                "RecommendationKey",
+                "KPIGroup"
+            }
+        ),
+ 
+    Final =
+        Value.ReplaceType(ExpandedRows, FinalType)
+        in
+            Final
+in
+    Output
