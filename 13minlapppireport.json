@@ -1,0 +1,236 @@
+{
+    "definition": {
+        "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+        "contentVersion": "1.0.0.0",
+        "triggers": {
+            "Recurrence": {
+                "recurrence": {
+                    "interval": 1,
+                    "frequency": "Day",
+                    "timeZone": "W. Europe Standard Time",
+                    "schedule": {
+                        "hours": [
+                            15
+                        ]
+                    }
+                },
+                "evaluatedRecurrence": {
+                    "interval": 1,
+                    "frequency": "Day",
+                    "timeZone": "W. Europe Standard Time",
+                    "schedule": {
+                        "hours": [
+                            15
+                        ]
+                    }
+                },
+                "type": "Recurrence",
+                "description": "trigger runs every day to get recommendations to blob"
+            }
+        },
+        "actions": {
+            "Initialize_variables": {
+                "runAfter": {},
+                "type": "InitializeVariable",
+                "inputs": {
+                    "variables": [
+                        {
+                            "name": "subscriptions",
+                            "type": "array",
+                            "value": [
+                                "f6205c41-42b1-4cad-a126-0c9e6f0ebfc7",
+                                "806cb204-0113-4764-80e8-d517d18e80d6"
+                            ]
+                        },
+                        {
+                            "name": "nextLink",
+                            "type": "string",
+                            "value": ""
+                        },
+                        {
+                            "name": "pageNumber",
+                            "type": "integer",
+                            "value": 0
+                        },
+                        {
+                            "name": "hasError",
+                            "type": "boolean",
+                            "value": false
+                        }
+                    ]
+                }
+            },
+            "For_each_subscription": {
+                "foreach": "@variables('subscriptions')",
+                "actions": {
+                    "Set_nextLink_to_subscription_URL": {
+                        "runAfter": {},
+                        "type": "SetVariable",
+                        "inputs": {
+                            "name": "nextLink",
+                            "value": "https://management.azure.com/subscriptions/@{items('For_each_subscription')}/providers/Microsoft.Advisor/recommendations?api-version=2025-01-01"
+                        }
+                    },
+                    "Until_no_more_pages": {
+                        "actions": {
+                            "HTTP_Get_Recommendations": {
+                                "runAfter": {},
+                                "type": "Http",
+                                "inputs": {
+                                    "uri": "@variables('nextLink')",
+                                    "method": "GET",
+                                    "authentication": {
+                                        "type": "ManagedServiceIdentity",
+                                        "audience": "https://management.azure.com/"
+                                    }
+                                }
+                            },
+                            "Increment_pageNumber": {
+                                "runAfter": {
+                                    "HTTP_Get_Recommendations": [
+                                        "Succeeded"
+                                    ]
+                                },
+                                "type": "IncrementVariable",
+                                "inputs": {
+                                    "name": "pageNumber",
+                                    "value": 1
+                                }
+                            },
+                            "Upload_page_to_blob": {
+                                "runAfter": {
+                                    "Increment_pageNumber": [
+                                        "Succeeded"
+                                    ]
+                                },
+                                "type": "Http",
+                                "inputs": {
+                                    "uri": "https://stwvdinonprod.blob.core.windows.net/allrecommendations/recommendations@{formatDateTime(trigger()?['startTime'],'yyyyMMdd')}_@{items('For_each_subscription')}_@{variables('pageNumber')}.json",
+                                    "method": "PUT",
+                                    "headers": {
+                                        "x-ms-blob-type": "BlockBlob",
+                                        "x-ms-version": "2021-08-06",
+                                        "Content-Type": "application/json"
+                                    },
+                                    "body": "@body('HTTP_Get_Recommendations')",
+                                    "authentication": {
+                                        "type": "ManagedServiceIdentity",
+                                        "audience": "https://storage.azure.com/"
+                                    }
+                                }
+                            },
+                            "Set_nextLink_from_response": {
+                                "runAfter": {
+                                    "Upload_page_to_blob": [
+                                        "Succeeded"
+                                    ]
+                                },
+                                "type": "SetVariable",
+                                "inputs": {
+                                    "name": "nextLink",
+                                    "value": "@{coalesce(body('HTTP_Get_Recommendations')?['nextLink'], '')}"
+                                }
+                            },
+                            "Set_hasError": {
+                                "runAfter": {
+                                    "Upload_page_to_blob": [
+                                        "Failed",
+                                        "Skipped",
+                                        "TimedOut"
+                                    ]
+                                },
+                                "type": "SetVariable",
+                                "inputs": {
+                                    "name": "hasError",
+                                    "value": true
+                                }
+                            },
+                            "Stop_paging_on_error": {
+                                "runAfter": {
+                                    "Set_hasError": [
+                                        "Succeeded"
+                                    ]
+                                },
+                                "type": "SetVariable",
+                                "inputs": {
+                                    "name": "nextLink",
+                                    "value": ""
+                                }
+                            }
+                        },
+                        "runAfter": {
+                            "Set_nextLink_to_subscription_URL": [
+                                "Succeeded"
+                            ]
+                        },
+                        "expression": "@empty(variables('nextLink'))",
+                        "limit": {
+                            "count": 5000,
+                            "timeout": "PT1H"
+                        },
+                        "type": "Until"
+                    }
+                },
+                "runAfter": {
+                    "Initialize_variables": [
+                        "Succeeded"
+                    ]
+                },
+                "type": "Foreach",
+                "runtimeConfiguration": {
+                    "concurrency": {
+                        "repetitions": 1
+                    }
+                }
+            },
+            "Condition_hasError": {
+                "actions": {
+                    "Terminate_failed": {
+                        "type": "Terminate",
+                        "inputs": {
+                            "runStatus": "Failed",
+                            "runError": {
+                                "code": "AdvisorFetchFailed",
+                                "message": "One or more Advisor pages failed to fetch or upload. Check the Until loop."
+                            }
+                        }
+                    }
+                },
+                "runAfter": {
+                    "For_each_subscription": [
+                        "Succeeded",
+                        "Failed",
+                        "TimedOut"
+                    ]
+                },
+                "else": {
+                    "actions": {}
+                },
+                "expression": {
+                    "and": [
+                        {
+                            "equals": [
+                                "@variables('hasError')",
+                                true
+                            ]
+                        }
+                    ]
+                },
+                "type": "If"
+            }
+        },
+        "outputs": {},
+        "parameters": {
+            "$connections": {
+                "type": "Object",
+                "defaultValue": {}
+            }
+        }
+    },
+    "parameters": {
+        "$connections": {
+            "type": "Object",
+            "value": {}
+        }
+    }
+}
