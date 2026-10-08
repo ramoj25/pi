@@ -1,0 +1,276 @@
+{
+    "definition": {
+        "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+        "contentVersion": "1.0.0.0",
+        "triggers": {
+            "Recurrence": {
+                "recurrence": {
+                    "interval": 1,
+                    "frequency": "Day",
+                    "timeZone": "W. Europe Standard Time",
+                    "schedule": {
+                        "hours": [
+                            15
+                        ]
+                    }
+                },
+                "evaluatedRecurrence": {
+                    "interval": 1,
+                    "frequency": "Day",
+                    "timeZone": "W. Europe Standard Time",
+                    "schedule": {
+                        "hours": [
+                            15
+                        ]
+                    }
+                },
+                "type": "Recurrence",
+                "description": "trigger runs every day to get recommendations to blob"
+            }
+        },
+        "actions": {
+            "Initialize_variables": {
+                "runAfter": {},
+                "type": "InitializeVariable",
+                "inputs": {
+                    "variables": [
+                        {
+                            "name": "subscriptions",
+                            "type": "array",
+                            "value": [
+                                "f6205c41-42b1-4cad-a126-0c9e6f0ebfc7",
+                                "806cb204-0113-4764-80e8-d517d18e80d6"
+                            ]
+                        },
+                        {
+                            "name": "allRecommendations",
+                            "type": "array",
+                            "value": []
+                        },
+                        {
+                            "name": "nextLink",
+                            "type": "string",
+                            "value": ""
+                        },
+                        {
+                            "name": "tempRecommendations",
+                            "type": "array",
+                            "value": []
+                        },
+                        {
+                            "name": "hasError",
+                            "type": "boolean",
+                            "value": false
+                        }
+                    ]
+                }
+            },
+            "For_each_subscription": {
+                "foreach": "@variables('subscriptions')",
+                "actions": {
+                    "Set_nextLink_to_subscription_URL": {
+                        "runAfter": {},
+                        "type": "SetVariable",
+                        "inputs": {
+                            "name": "nextLink",
+                            "value": "https://management.azure.com/subscriptions/@{items('For_each_subscription')}/providers/Microsoft.Advisor/recommendations?api-version=2025-01-01"
+                        }
+                    },
+                    "Until_no_more_pages": {
+                        "actions": {
+                            "HTTP_Get_Recommendations": {
+                                "runAfter": {},
+                                "type": "Http",
+                                "inputs": {
+                                    "uri": "@variables('nextLink')",
+                                    "method": "GET",
+                                    "authentication": {
+                                        "type": "ManagedServiceIdentity",
+                                        "audience": "https://management.azure.com/"
+                                    }
+                                }
+                            },
+                            "Select_page_recommendations": {
+                                "runAfter": {
+                                    "HTTP_Get_Recommendations": [
+                                        "Succeeded"
+                                    ]
+                                },
+                                "type": "Select",
+                                "inputs": {
+                                    "from": "@coalesce(body('HTTP_Get_Recommendations')?['value'], json('[]'))",
+                                    "select": {
+                                        "SubscriptionId": "@{items('For_each_subscription')}",
+                                        "RecommendationId": "@{item()?['id']}",
+                                        "RecommendationName": "@{item()?['name']}",
+                                        "Category": "@{item()?['properties']?['category']}",
+                                        "Impact": "@{item()?['properties']?['impact']}",
+                                        "ImpactedField": "@{item()?['properties']?['impactedField']}",
+                                        "ImpactedValue": "@{item()?['properties']?['impactedValue']}",
+                                        "RecommendationTypeId": "@{item()?['properties']?['recommendationTypeId']}",
+                                        "Problem": "@{item()?['properties']?['shortDescription']?['problem']}",
+                                        "Solution": "@{item()?['properties']?['shortDescription']?['solution']}",
+                                        "RecommendationSubCategory": "@{item()?['properties']?['extendedProperties']?['recommendationSubCategory']}",
+                                        "MaturityLevel": "@{item()?['properties']?['extendedProperties']?['maturityLevel']}",
+                                        "ResourceId": "@{item()?['properties']?['resourceMetadata']?['resourceId']}",
+                                        "LastUpdated": "@{item()?['properties']?['lastUpdated']}"
+                                    }
+                                }
+                            },
+                            "Set_tempRecommendations": {
+                                "runAfter": {
+                                    "Select_page_recommendations": [
+                                        "Succeeded"
+                                    ]
+                                },
+                                "type": "SetVariable",
+                                "inputs": {
+                                    "name": "tempRecommendations",
+                                    "value": "@union(variables('allRecommendations'), body('Select_page_recommendations'))"
+                                }
+                            },
+                            "Set_allRecommendations": {
+                                "runAfter": {
+                                    "Set_tempRecommendations": [
+                                        "Succeeded"
+                                    ]
+                                },
+                                "type": "SetVariable",
+                                "inputs": {
+                                    "name": "allRecommendations",
+                                    "value": "@variables('tempRecommendations')"
+                                }
+                            },
+                            "Set_nextLink_from_response": {
+                                "runAfter": {
+                                    "Set_allRecommendations": [
+                                        "Succeeded"
+                                    ]
+                                },
+                                "type": "SetVariable",
+                                "inputs": {
+                                    "name": "nextLink",
+                                    "value": "@{coalesce(body('HTTP_Get_Recommendations')?['nextLink'], '')}"
+                                }
+                            },
+                            "Set_hasError": {
+                                "runAfter": {
+                                    "Select_page_recommendations": [
+                                        "Failed",
+                                        "Skipped",
+                                        "TimedOut"
+                                    ]
+                                },
+                                "type": "SetVariable",
+                                "inputs": {
+                                    "name": "hasError",
+                                    "value": true
+                                }
+                            },
+                            "Stop_paging_on_error": {
+                                "runAfter": {
+                                    "Set_hasError": [
+                                        "Succeeded"
+                                    ]
+                                },
+                                "type": "SetVariable",
+                                "inputs": {
+                                    "name": "nextLink",
+                                    "value": ""
+                                }
+                            }
+                        },
+                        "runAfter": {
+                            "Set_nextLink_to_subscription_URL": [
+                                "Succeeded"
+                            ]
+                        },
+                        "expression": "@empty(variables('nextLink'))",
+                        "limit": {
+                            "count": 5000,
+                            "timeout": "PT1H"
+                        },
+                        "type": "Until"
+                    }
+                },
+                "runAfter": {
+                    "Initialize_variables": [
+                        "Succeeded"
+                    ]
+                },
+                "type": "Foreach",
+                "runtimeConfiguration": {
+                    "concurrency": {
+                        "repetitions": 1
+                    }
+                }
+            },
+            "Condition_hasError": {
+                "actions": {
+                    "Terminate_failed": {
+                        "type": "Terminate",
+                        "inputs": {
+                            "runStatus": "Failed",
+                            "runError": {
+                                "code": "AdvisorFetchFailed",
+                                "message": "One or more Advisor API calls failed. Check HTTP_Get_Recommendations in the Until loop."
+                            }
+                        }
+                    }
+                },
+                "runAfter": {
+                    "For_each_subscription": [
+                        "Succeeded",
+                        "Failed",
+                        "TimedOut"
+                    ]
+                },
+                "else": {
+                    "actions": {
+                        "Upload_to_blob": {
+                            "type": "Http",
+                            "inputs": {
+                                "uri": "https://stwvdinonprod.blob.core.windows.net/allrecommendations/advisor-recommendations-@{formatDateTime(utcNow(),'yyyy-MM-dd')}.json",
+                                "method": "PUT",
+                                "headers": {
+                                    "x-ms-blob-type": "BlockBlob",
+                                    "x-ms-version": "2021-08-06",
+                                    "Content-Type": "application/json"
+                                },
+                                "body": "@variables('allRecommendations')",
+                                "authentication": {
+                                    "type": "ManagedServiceIdentity",
+                                    "audience": "https://storage.azure.com/"
+                                }
+                            }
+                        }
+                    }
+                },
+                "expression": {
+                    "and": [
+                        {
+                            "equals": [
+                                "@variables('hasError')",
+                                true
+                            ]
+                        }
+                    ]
+                },
+                "type": "If"
+            }
+        },
+        "outputs": {},
+        "parameters": {
+            "$connections": {
+                "type": "Object",
+                "defaultValue": {}
+            }
+        }
+    },
+    "parameters": {
+        "$connections": {
+            "type": "Object",
+            "value": {}
+        }
+    }
+}
